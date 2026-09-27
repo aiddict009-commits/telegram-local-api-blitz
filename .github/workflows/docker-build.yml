@@ -5,7 +5,11 @@ on:
     branches: [main]
     paths:
       - "Dockerfile"
+      - "blitz-cdn-proxy.js"
+      - "server.js"
+      - "start.sh"
       - ".github/workflows/docker-build.yml"
+
   workflow_dispatch: {}
 
 env:
@@ -14,6 +18,7 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       packages: write
