@@ -1,4 +1,3 @@
-# Build Telegram Local Bot API
 FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -25,16 +24,21 @@ RUN mkdir build \
     && cmake --build . --target telegram-bot-api -j2
 
 
-# Runtime image
-FROM debian:bookworm-slim
+FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
-    zlib1g \
+    nodejs \
+    npm \
+    ffmpeg \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Blitz runs containers as UID 1000/GID 1000
+RUN python3 -m pip install \
+    --break-system-packages \
+    yt-dlp
+
 RUN groupadd -g 1000 telegram \
     && useradd -u 1000 -g 1000 -m -s /bin/sh telegram
 
@@ -42,17 +46,19 @@ COPY --from=builder \
     /src/telegram-bot-api/build/telegram-bot-api \
     /usr/local/bin/telegram-bot-api
 
-RUN mkdir -p /data /data/temp \
-    && chown -R 1000:1000 /data
+WORKDIR /app
+
+COPY blitz-cdn-proxy.js /app/blitz-cdn-proxy.js
+COPY server.js /app/server.js
+COPY start.sh /app/start.sh
+
+RUN chmod +x /app/start.sh
+
+RUN mkdir -p /data/temp \
+    && chown -R 1000:1000 /data /app
 
 USER 1000:1000
 
-WORKDIR /data
+EXPOSE 8080
 
-EXPOSE 8081
-
-CMD ["telegram-bot-api", \
-     "--local", \
-     "--http-port=8081", \
-     "--dir=/data", \
-     "--temp-dir=/data/temp"]
+CMD ["/app/start.sh"]
