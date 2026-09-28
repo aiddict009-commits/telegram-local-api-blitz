@@ -1,16 +1,16 @@
+
 name: Build and push telegram-bot-api image
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - "Dockerfile"
-      - "blitz-cdn-proxy.js"
       - "server.js"
-      - "start.sh"
+      - "package.json"
       - ".github/workflows/docker-build.yml"
-
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/telegram-bot-api
