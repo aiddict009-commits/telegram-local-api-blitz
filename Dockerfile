@@ -3,8 +3,14 @@
 FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
-    git cmake g++ make pkg-config \
-    zlib1g-dev libssl-dev gperf \
+    git \
+    cmake \
+    g++ \
+    make \
+    pkg-config \
+    zlib1g-dev \
+    libssl-dev \
+    gperf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -19,7 +25,7 @@ RUN mkdir build \
     && cmake -DCMAKE_BUILD_TYPE=Release .. \
     && cmake --build . --target telegram-bot-api -j2
 
-# Final runtime
+# Runtime image
 FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -29,14 +35,11 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp in an isolated Python environment
+# Install yt-dlp in a virtual environment
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir yt-dlp
 
-# Create non-root user
-RUN groupadd -g 1000 app \
-    && useradd -u 1000 -g 1000 -m -s /bin/sh app
-
+# Copy Telegram Local Bot API
 COPY --from=builder \
     /src/telegram-bot-api/build/telegram-bot-api \
     /usr/local/bin/telegram-bot-api
@@ -44,17 +47,16 @@ COPY --from=builder \
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install --omit=dev
-
 COPY server.js ./
 
+# Prepare temporary storage and permissions
 RUN mkdir -p /data/temp /data/jobs \
-    && chown -R 1000:1000 /app /data
+    && chown -R node:node /app /data
 
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PORT=8080
 
-USER 1000:1000
+USER node:node
 
 EXPOSE 8080
 
