@@ -7,6 +7,7 @@ import { mkdir, readdir, stat, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT || 8080);
+console.log("[config] PORT =", process.env.PORT, "| Node listens on =", PORT);
 const API_KEY = process.env.DOWNLOADER_API_KEY;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CACHE_CHANNEL_ID = process.env.CACHE_CHANNEL_ID;
