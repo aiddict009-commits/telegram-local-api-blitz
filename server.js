@@ -2,7 +2,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, stat, rm, openAsBlob } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, readdir, stat, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -12,84 +13,126 @@ const CACHE_CHANNEL_ID = process.env.CACHE_CHANNEL_ID;
 const API_ID = process.env.TELEGRAM_API_ID;
 const API_HASH = process.env.TELEGRAM_API_HASH;
 
-const LOCAL_API = "http://127.0.0.1:8081";
+const LOCAL_API_HOST = "127.0.0.1";
+const LOCAL_API_PORT = 8081;
 const JOB_DIR = "/data/jobs";
 const MAX_SIZE = 300 * 1024 * 1024;
+const MAX_DURATION_MS = 15 * 60 * 1000;
 
 const formats = {
-  "360p": "bv*[height<=360]+ba/b[height<=360]/b",
-  "480p": "bv*[height<=480]+ba/b[height<=480]/b",
-  "720p": "bv*[height<=720]+ba/b[height<=720]/b",
-  "1080p": "bv*[height<=1080]+ba/b[height<=1080]/b"
+  "360p": "bv*[height<=360]+ba/b[height<=360]",
+  "480p": "bv*[height<=480]+ba/b[height<=480]",
+  "720p": "bv*[height<=720]+ba/b[height<=720]",
+  "1080p": "bv*[height<=1080]+ba/b[height<=1080]"
 };
 
 function sendJson(res, status, data) {
+  if (res.headersSent) return;
   res.writeHead(status, {
-    "content-type": "application/json"
+    "content-type": "application/json; charset=utf-8"
   });
   res.end(JSON.stringify(data));
 }
 
-// Start Telegram Local Bot API.
-const telegram = spawn("telegram-bot-api", [
-  "--local",
-  "--http-port=8081",
-  "--api-id=" + API_ID,
-  "--api-hash=" + API_HASH,
-  "--dir=/data",
-  "--temp-dir=/data/temp"
-]);
+const missingConfig = [
+  ["DOWNLOADER_API_KEY", API_KEY],
+  ["BOT_TOKEN", BOT_TOKEN],
+  ["CACHE_CHANNEL_ID", CACHE_CHANNEL_ID],
+  ["TELEGRAM_API_ID", API_ID],
+  ["TELEGRAM_API_HASH", API_HASH]
+].filter(([, value]) => !value).map(([name]) => name);
 
-telegram.stdout.on("data", data =>
-  console.log("[telegram]", data.toString().trim())
-);
+let telegramReady = false;
+let telegramProcess = null;
+let busy = false;
 
-telegram.stderr.on("data", data =>
-  console.log("[telegram]", data.toString().trim())
-);
+if (missingConfig.length === 0) {
+  telegramProcess = spawn("telegram-bot-api", [
+    "--local",
+    "--http-port=8081",
+    `--api-id=${API_ID}`,
+    `--api-hash=${API_HASH}`,
+    "--dir=/data",
+    "--temp-dir=/data/temp"
+  ]);
 
-telegram.on("exit", code => {
-  console.error("[telegram] exited:", code);
-});
+  telegramProcess.stdout.on("data", data =>
+    console.log("[telegram]", data.toString().trim())
+  );
+
+  telegramProcess.stderr.on("data", data =>
+    console.log("[telegram]", data.toString().trim())
+  );
+
+  telegramProcess.on("error", error => {
+    telegramReady = false;
+    console.error("[telegram] process error:", error);
+  });
+
+  telegramProcess.on("exit", code => {
+    telegramReady = false;
+    console.error("[telegram] exited with code:", code);
+  });
+} else {
+  console.error(
+    "[config] Missing environment variables:",
+    missingConfig.join(", ")
+  );
+}
 
 async function waitForTelegram() {
-  if (!BOT_TOKEN) {
-    throw new Error("BOT_TOKEN is missing");
-  }
+  for (let attempt = 0; attempt < 45; attempt++) {
+    if (!telegramProcess || telegramProcess.exitCode !== null) {
+      throw new Error("Telegram Local Bot API is not running");
+    }
 
-  for (let i = 0; i < 30; i++) {
     try {
       const response = await fetch(
-        `${LOCAL_API}/bot${BOT_TOKEN}/getMe`
+        `http://${LOCAL_API_HOST}:${LOCAL_API_PORT}/bot${BOT_TOKEN}/getMe`,
+        { signal: AbortSignal.timeout(4000) }
       );
 
-      if (response.ok) {
-        const result = await response.json();
-        if (result.ok) return;
+      const result = await response.json();
+
+      if (response.ok && result.ok) {
+        telegramReady = true;
+        return;
       }
-    } catch {}
+    } catch {
+      // The Local Bot API may still be starting.
+    }
 
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
 
-  throw new Error("Telegram Local Bot API did not start");
+  throw new Error("Telegram Local Bot API did not become ready");
 }
 
-async function readBody(req) {
+if (telegramProcess) {
+  waitForTelegram()
+    .then(() => console.log("[telegram] API is ready"))
+    .catch(error => console.error("[telegram] startup:", error.message));
+}
+
+async function readJson(req) {
   let body = "";
 
   for await (const chunk of req) {
-    body += chunk.toString();
+    body += chunk.toString("utf8");
 
     if (body.length > 20000) {
-      throw new Error("Request body too large");
+      throw new Error("Request body is too large");
     }
   }
 
-  return JSON.parse(body);
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error("Request body must be valid JSON");
+  }
 }
 
-function runDownloader(url, quality, output) {
+function runDownloader(url, quality, outputTemplate) {
   return new Promise((resolve, reject) => {
     const child = spawn("/opt/venv/bin/yt-dlp", [
       "--no-playlist",
@@ -98,11 +141,24 @@ function runDownloader(url, quality, output) {
       "--max-filesize", "300M",
       "--merge-output-format", "mp4",
       "-f", formats[quality],
-      "-o", output,
+      "-o", outputTemplate,
       url
     ]);
 
     let errorText = "";
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      if (!settled) {
+        settled = true;
+        reject(new Error("Download timed out after 15 minutes"));
+      }
+    }, MAX_DURATION_MS);
+
+    child.stdout.on("data", chunk => {
+      console.log("[yt-dlp]", chunk.toString().trim());
+    });
 
     child.stderr.on("data", chunk => {
       const line = chunk.toString();
@@ -115,87 +171,156 @@ function runDownloader(url, quality, output) {
       console.log("[yt-dlp]", line.trim());
     });
 
-    child.stdout.on("data", chunk =>
-      console.log("[yt-dlp]", chunk.toString().trim())
-    );
-
-    child.on("error", reject);
+    child.on("error", error => {
+      clearTimeout(timeout);
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
 
     child.on("close", code => {
+      clearTimeout(timeout);
+
+      if (settled) return;
+      settled = true;
+
       if (code === 0) {
         resolve();
       } else {
         reject(new Error(
-          errorText.slice(-3000) || `yt-dlp exited: ${code}`
+          errorText.slice(-3000) || `yt-dlp exited with code ${code}`
         ));
       }
     });
   });
 }
 
+// Stream the local file to Telegram without buffering the whole video.
 async function uploadToCache(filePath, quality) {
-  const form = new FormData();
+  const fileInfo = await stat(filePath);
+  const filename = path.basename(filePath).replace(/["\r\n]/g, "_");
+  const boundary = `----SlapVideo${randomUUID().replace(/-/g, "")}`;
 
-  form.append("chat_id", CACHE_CHANNEL_ID);
-  form.append("caption", `SlapVideo cache • ${quality}`);
+  const fields =
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
+    `${CACHE_CHANNEL_ID}\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="caption"\r\n\r\n` +
+    `SlapVideo cache • ${quality}\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="video"; filename="${filename}"\r\n` +
+    `Content-Type: video/mp4\r\n\r\n`;
 
-  // File-backed Blob avoids loading the entire video into RAM.
-  const videoBlob = await openAsBlob(filePath, {
-    type: "video/mp4"
-  });
+  const ending = `\r\n--${boundary}--\r\n`;
+  const prefixBuffer = Buffer.from(fields);
+  const endingBuffer = Buffer.from(ending);
 
-  form.append("video", videoBlob, path.basename(filePath));
+  const contentLength =
+    prefixBuffer.length + fileInfo.size + endingBuffer.length;
 
-  const response = await fetch(
-    `${LOCAL_API}/bot${BOT_TOKEN}/sendVideo`,
-    {
+  return new Promise((resolve, reject) => {
+    const upload = http.request({
+      hostname: LOCAL_API_HOST,
+      port: LOCAL_API_PORT,
+      path: `/bot${BOT_TOKEN}/sendVideo`,
       method: "POST",
-      body: form
-    }
-  );
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": contentLength
+      }
+    }, response => {
+      let responseBody = "";
 
-  const result = await response.json();
+      response.setEncoding("utf8");
+      response.on("data", chunk => {
+        responseBody += chunk;
+      });
 
-  if (!response.ok || !result.ok) {
-    throw new Error(
-      "Telegram upload failed: " + JSON.stringify(result)
-    );
-  }
+      response.on("end", () => {
+        let result;
 
-  return result.result;
+        try {
+          result = JSON.parse(responseBody);
+        } catch {
+          reject(new Error("Telegram returned an invalid response"));
+          return;
+        }
+
+        if (
+          response.statusCode < 200 ||
+          response.statusCode >= 300 ||
+          !result.ok
+        ) {
+          reject(new Error(
+            "Telegram upload failed: " +
+            JSON.stringify(result).slice(0, 2000)
+          ));
+          return;
+        }
+
+        resolve(result.result);
+      });
+    });
+
+    upload.on("error", reject);
+
+    upload.write(prefixBuffer);
+
+    const fileStream = createReadStream(filePath);
+
+    fileStream.on("error", error => upload.destroy(error));
+    fileStream.on("end", () => upload.end(endingBuffer));
+    fileStream.pipe(upload, { end: false });
+  });
 }
 
 async function cleanup(folder) {
-  await rm(folder, {
-    recursive: true,
-    force: true
-  });
-}
+  if (!folder) return;
 
-let busy = false;
+  try {
+    await rm(folder, { recursive: true, force: true });
+  } catch (error) {
+    console.error("[cleanup] failed:", error.message);
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
-    sendJson(res, 200, {
-      ok: true,
+    const ready = telegramReady && !missingConfig.length;
+
+    sendJson(res, ready ? 200 : 503, {
+      ok: ready,
       service: "slapvideo-backend",
+      telegramReady,
       busy
     });
     return;
   }
 
   if (req.method !== "POST" || req.url !== "/download") {
-    sendJson(res, 404, {
-      ok: false,
-      error: "Not found"
-    });
+    sendJson(res, 404, { ok: false, error: "Not found" });
     return;
   }
 
   if (!API_KEY || req.headers["x-api-key"] !== API_KEY) {
-    sendJson(res, 401, {
+    sendJson(res, 401, { ok: false, error: "Unauthorized" });
+    return;
+  }
+
+  if (missingConfig.length) {
+    sendJson(res, 503, {
       ok: false,
-      error: "Unauthorized"
+      error: "Backend environment variables are missing"
+    });
+    return;
+  }
+
+  if (!telegramReady) {
+    sendJson(res, 503, {
+      ok: false,
+      error: "Telegram Local Bot API is not ready"
     });
     return;
   }
@@ -212,23 +337,19 @@ const server = http.createServer(async (req, res) => {
   let folder;
 
   try {
-    if (!API_ID || !API_HASH || !BOT_TOKEN || !CACHE_CHANNEL_ID) {
-      throw new Error("Telegram environment variables are missing");
-    }
-
-    const body = await readBody(req);
+    const body = await readJson(req);
     const url = String(body.url || "").trim();
     const quality = String(body.quality || "720p");
 
-    let parsed;
+    let parsedUrl;
 
     try {
-      parsed = new URL(url);
+      parsedUrl = new URL(url);
     } catch {
       throw new Error("Please provide a valid video URL");
     }
 
-    if (!["http:", "https:"].includes(parsed.protocol)) {
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
       throw new Error("Only HTTP and HTTPS URLs are supported");
     }
 
@@ -236,20 +357,14 @@ const server = http.createServer(async (req, res) => {
       throw new Error("Unsupported quality");
     }
 
-    await waitForTelegram();
-
     folder = path.join(JOB_DIR, randomUUID());
+    await mkdir(folder, { recursive: true });
 
-    await mkdir(folder, {
-      recursive: true
-    });
+    const outputTemplate = path.join(folder, "video.%(ext)s");
 
-    const template = path.join(folder, "video.%(ext)s");
-
-    await runDownloader(url, quality, template);
+    await runDownloader(url, quality, outputTemplate);
 
     const files = await readdir(folder);
-
     const videoName = files.find(name =>
       /\.(mp4|mkv|webm|mov)$/i.test(name)
     );
@@ -284,10 +399,7 @@ const server = http.createServer(async (req, res) => {
       error: error.message || "Download failed"
     });
   } finally {
-    if (folder) {
-      await cleanup(folder);
-    }
-
+    await cleanup(folder);
     busy = false;
   }
 });
@@ -295,3 +407,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[server] listening on port ${PORT}`);
 });
+
+function shutdown() {
+  console.log("[server] shutting down");
+  server.close();
+  if (telegramProcess && telegramProcess.exitCode === null) {
+    telegramProcess.kill("SIGTERM");
+  }
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
