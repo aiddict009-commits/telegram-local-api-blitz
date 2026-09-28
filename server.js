@@ -15,7 +15,7 @@ const API_ID = process.env.TELEGRAM_API_ID;
 const API_HASH = process.env.TELEGRAM_API_HASH;
 
 const LOCAL_API_HOST = "127.0.0.1";
-const LOCAL_API_PORT = 8081;
+const LOCAL_API_PORT = 8082;
 const JOB_DIR = "/data/jobs";
 const MAX_SIZE = 300 * 1024 * 1024;
 const MAX_DURATION_MS = 15 * 60 * 1000;
@@ -50,7 +50,7 @@ let busy = false;
 if (missingConfig.length === 0) {
   telegramProcess = spawn("telegram-bot-api", [
     "--local",
-    "--http-port=8081",
+    "--http-port=8082",
     `--api-id=${API_ID}`,
     `--api-hash=${API_HASH}`,
     "--dir=/data",
